@@ -1,0 +1,3 @@
+# The only third-party import in chatgpt-http-helper.py; everything else it
+# uses ships with CPython.
+curl_cffi>=0.7.0

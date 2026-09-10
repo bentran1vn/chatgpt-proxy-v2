@@ -182,6 +182,22 @@ Phải dùng `-9` cho helper: hàm `shutdown()` của nó gọi `server.shutdown
 trong signal handler trong khi `serve_forever()` đang khoá cùng thread, nên
 SIGTERM bị deadlock.
 
+## Chạy bằng Docker
+
+Toàn bộ proxy đóng gói thành **một image chạy hai tiến trình** (bun + helper
+Python), vì provider gọi helper qua `127.0.0.1:1436` nên không tách container
+được. Cookie và ảnh sinh ra nằm ở volume `/data`, không mất khi rebuild.
+
+```bash
+cp .docker/.env.example .docker/.env     # điền CHATGPT_COOKIES, CHATGPT_ACCESS_TOKEN
+docker compose -f .docker/docker-compose.yml --env-file .docker/.env up -d --build
+curl http://127.0.0.1:1435/health
+```
+
+Trên server deploy, container còn nối vào `hoatheomua-network-dev` và
+`hoatheomua-network-prod` nên API gọi được qua `http://chatgpt-proxy-prod:1435/v1`.
+Chi tiết deploy, xoay access token và CI/CD: xem [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## Model
 
 | Dùng khi | Model |
@@ -220,6 +236,20 @@ Bên dưới, mỗi ảnh đi qua luồng upload ba bước của ChatGPT (đăn
 blob storage → chốt), rồi lượt chat được gửi dạng `multimodal_text` kèm phần
 `image_asset_pointer`. Upload được cache theo SHA-256 nên cùng một ảnh gửi lại
 qua nhiều lượt chỉ đăng ký một lần.
+
+Thứ tự bạn viết được giữ nguyên. Prompt dạng
+`[text, ảnh, text, ảnh]` tới ChatGPT đúng thứ tự đó, nên văn bản nằm giữa hai
+ảnh vẫn ở giữa chứ không bị dồn xuống cuối:
+
+```json
+"content": [
+  {"type": "text",      "text": "Ảnh MỘT:"},
+  {"type": "image_url", "image_url": {"url": "..."}},
+  {"type": "text",      "text": "Ảnh HAI:"},
+  {"type": "image_url", "image_url": {"url": "..."}},
+  {"type": "text",      "text": "MỘT màu gì, HAI màu gì?"}
+]
+```
 
 Lưu ý:
 
@@ -288,9 +318,11 @@ request giữ chế độ tạm thời và tính năng vẽ tắt hoàn toàn.
 | 9 | Phục vụ `/files/` và ba kiểu path traversal | không |
 | 10 | Không còn hội thoại nào sót lại trong 30 phút gần nhất | không |
 
-Test số 10 là cái đáng để mắt. Khi request crash hoặc timeout giữa chừng, bước
-dọn dẹp không chạy và hội thoại có thể sót lại trên tài khoản — đó là hành vi
-thật chứ không phải test chập chờn. Nếu nó fail, có thứ cần xoá bằng tay.
+Test số 10 hỏi thẳng helper xem nó đã tạo ra hội thoại nào mà chưa xoá được
+(trường `undeleted_conversations` trong `/health`), chứ không quét danh sách hội
+thoại của tài khoản — quét như vậy sẽ gắn cờ nhầm cả những hội thoại bạn đang tự
+tạo trong trình duyệt. Khi request crash hoặc timeout giữa chừng, bước dọn không
+chạy và hội thoại sót lại; test này sẽ chỉ đúng ID cần xoá tay.
 
 ## Giới hạn đã biết
 
@@ -630,6 +662,24 @@ curl http://127.0.0.1:1436/cookies
 curl http://127.0.0.1:1436/refresh
 ```
 
+## Running with Docker
+
+The proxy ships as **one image running two processes** (bun + the Python
+helper): the provider reaches the helper over `127.0.0.1:1436`, so they cannot
+be split. Cookies and generated images live on the `/data` volume and survive
+rebuilds.
+
+```bash
+cp .docker/.env.example .docker/.env     # fill in CHATGPT_COOKIES, CHATGPT_ACCESS_TOKEN
+docker compose -f .docker/docker-compose.yml --env-file .docker/.env up -d --build
+curl http://127.0.0.1:1435/health
+```
+
+On the deploy host the container also joins `hoatheomua-network-dev` and
+`hoatheomua-network-prod`, so the APIs reach it at
+`http://chatgpt-proxy-prod:1435/v1`. Deployment, token rotation and CI/CD are
+covered in [DEPLOYMENT.md](DEPLOYMENT.md).
+
 ## Available ChatGPT Models
 
 Use these as the `model` parameter:
@@ -732,6 +782,10 @@ Behind the scenes each picture goes through ChatGPT's three-step upload
 `multimodal_text` with an `image_asset_pointer` part. Uploads are cached by
 SHA-256, so the same picture re-sent across turns is only registered once.
 
+Part order is preserved: a prompt written as `[text, image, text, image]`
+reaches ChatGPT in that order, so text sitting between two pictures stays
+between them rather than being hoisted to the end.
+
 Notes:
 
 - Only **user** turns carry images; parts on other roles are ignored.
@@ -763,10 +817,11 @@ Notes:
 | 9 | `/files/` serving plus three path-traversal attempts | no |
 | 10 | No conversation from the last 30 min survived on the account | no |
 
-Test 10 is the one to watch. A crash or timeout mid-request skips the cleanup
-step, so a conversation can survive on the account - that is exactly how it
-behaves, not a flaky test. Failures there mean something needs deleting by
-hand.
+Test 10 asks the helper which conversations it created and failed to delete
+(the `undeleted_conversations` field on `/health`) rather than scanning the
+account's conversation list - scanning would flag whatever the user happens to
+be doing in their browser at the time. A crash or timeout mid-request skips the
+cleanup step, and this test names the exact IDs that need deleting by hand.
 
 ## Known Limitations
 

@@ -1,0 +1,116 @@
+name: Deploy Application
+on:
+  workflow_call:
+    inputs:
+      profile:
+        required: true
+        type: string
+      actor:
+        required: true
+        type: string
+      repository:
+        required: true
+        type: string
+      run-on:
+        required: false
+        default: self-hosted
+        type: string
+      tag:
+        required: false
+        default: prod-latest
+        type: string
+      environment:
+        required: false
+        default: prod
+        type: string
+      pull-profile:
+        required: false
+        default: prod-pull
+        type: string
+jobs:
+  deploy-application:
+    runs-on: ${{ inputs.run-on }}
+    environment: ${{ inputs.environment }}
+    env:
+      REGISTRY: ghcr.io/${{ inputs.repository }}
+
+      # Host port published for this environment (container always listens on 1435)
+      HTTP_PORT: ${{ secrets.HTTP_PORT }}
+      TZ: ${{ secrets.TZ }}
+
+      # Upstream backend for non-chatgpt/* models (optional)
+      UPSTREAM_URL: ${{ secrets.UPSTREAM_URL }}
+      UPSTREAM_KEY: ${{ secrets.UPSTREAM_KEY }}
+
+      # ChatGPT web credentials. CHATGPT_ACCESS_TOKEN is an RS256 JWT valid for
+      # ~10 days: when the proxy starts returning auth errors, refresh this
+      # environment secret (.docker/sync-env-secrets.sh) and re-run the workflow.
+      CHATGPT_COOKIES: ${{ secrets.CHATGPT_COOKIES }}
+      CHATGPT_ACCESS_TOKEN: ${{ secrets.CHATGPT_ACCESS_TOKEN }}
+
+      # Public base for the /files/ links handed back with generated images —
+      # must be the URL clients reach the proxy on, not the container's port.
+      # In-cluster callers use http://chatgpt-proxy-prod:1435 over the shared
+      # hoatheomua networks.
+      CHATGPT_FILES_BASE: ${{ secrets.CHATGPT_FILES_BASE }}
+      CHATGPT_NEVER_STORE: ${{ secrets.CHATGPT_NEVER_STORE }}
+
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase Repository Name
+        run: |
+          REPO_LOWER=$(echo "${{ inputs.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "REGISTRY=ghcr.io/$REPO_LOWER" >> $GITHUB_ENV
+
+      # compose.yaml attaches to hoatheomua-be's networks as external ones, so
+      # `up` fails outright if they are missing. Create them idempotently rather
+      # than depending on the other stack's deploy order.
+      - name: Ensure Shared Networks Exist
+        run: |
+          for net in hoatheomua-network-dev hoatheomua-network-prod; do
+            docker network inspect "$net" >/dev/null 2>&1 || docker network create "$net"
+          done
+
+      - name: Pull New Image From Registry
+        run: docker compose -f .docker/compose.yaml -p chatgpt-proxy-${{ inputs.profile }} --profile ${{ inputs.pull-profile }} pull
+
+      - name: Deploy New Image
+        run: docker compose -f .docker/compose.yaml -p chatgpt-proxy-${{ inputs.profile }} --profile ${{ inputs.environment }} up -d
+
+      # The credentials are only checked when the helper handshakes chatgpt.com,
+      # so a container that comes up is not yet proof of a working deploy: wait
+      # for /health to report chatgpt enabled before calling it done.
+      - name: Verify Health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${HTTP_PORT}/health" | tee /tmp/health.json | grep -q '"status":"ok"'; then
+              echo "Proxy healthy ✓"
+              grep -q '"enabled":true' /tmp/health.json || echo "::warning::ChatGPT provider is disabled — CHATGPT_COOKIES may be missing or stale"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Proxy did not become healthy in time"
+          docker logs chatgpt-proxy-${{ inputs.environment }} --tail 100 || true
+          exit 1
+
+      - name: Prune Old Image
+        run: docker image prune -af
+
+      - name: Notify Deployment Success
+        run: |
+          echo "Deployment completed successfully!"
+          echo "Proxy is running and healthy on port ${HTTP_PORT}"

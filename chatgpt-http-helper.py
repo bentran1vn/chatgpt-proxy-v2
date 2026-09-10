@@ -25,8 +25,12 @@ PORT = int(os.environ.get('CHATGPT_BRIDGE_PORT', '1436'))
 IMPERSONATE = "safari17_0"
 CHATGPT_BASE = "https://chatgpt.com"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-COOKIE_FILE = os.path.join(SCRIPT_DIR, '.cookies.json')
-IMAGE_DIR = os.path.join(SCRIPT_DIR, '.generated_images')
+# Both paths are overridable so a container can point them at a mounted volume:
+# in the image the source tree is read-only-ish and would lose the session
+# cookies and every generated image on each redeploy.
+DATA_DIR = os.environ.get('CHATGPT_DATA_DIR', SCRIPT_DIR)
+COOKIE_FILE = os.environ.get('CHATGPT_COOKIE_FILE', os.path.join(DATA_DIR, '.cookies.json'))
+IMAGE_DIR = os.environ.get('CHATGPT_IMAGE_DIR', os.path.join(DATA_DIR, '.generated_images'))
 
 # Generated images are handed back as markdown links rather than inline base64:
 # a 2MB PNG becomes ~2.8MB of base64 and chokes most OpenAI clients. Points at
@@ -58,6 +62,12 @@ dpl_fetched_at = 0
 lock = threading.Lock()
 cookie_update_count = 0  # Track how many times cookies got updated
 last_cookie_update = 0
+
+# Conversations this process created and could not delete afterwards - a
+# request that dies mid-flight never reaches the cleanup step. Exposed on
+# /health so it can be checked without guessing from the account's own list,
+# which also contains whatever the user is doing in their browser.
+undeleted_conversations = []
 
 # ── Session (the key change — replaces raw cffi_requests calls) ──
 session: Any = None
@@ -570,20 +580,30 @@ def upload_image(token, url):
 
 
 def split_content(content):
-    """Split OpenAI-style content into (text, [image urls])."""
+    """Split OpenAI-style content into (plain text, ordered items).
+
+    Items are ('text', str) / ('image', url) in the order the caller wrote
+    them, so text sitting between two pictures stays between them instead of
+    being hoisted to the end.
+    """
     if not isinstance(content, list):
-        return (content if isinstance(content, str) else json.dumps(content)), []
-    texts, urls = [], []
+        text = content if isinstance(content, str) else json.dumps(content)
+        return text, ([('text', text)] if text else [])
+
+    items = []
     for part in content:
         if not isinstance(part, dict):
             continue
         if part.get('type') == 'text':
-            texts.append(part.get('text', ''))
+            text = part.get('text', '')
+            if text:
+                items.append(('text', text))
         elif part.get('type') == 'image_url':
             url = (part.get('image_url') or {}).get('url', '')
             if url:
-                urls.append(url)
-    return '\n'.join(texts), urls
+                items.append(('image', url))
+
+    return '\n'.join(v for kind, v in items if kind == 'text'), items
 
 
 def message_text(msg):
@@ -647,15 +667,33 @@ def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
     chatgpt_messages = []
     for msg in messages:
         role = msg.get('role', 'user')
-        content, image_urls = split_content(msg.get('content', ''))
+        content, items = split_content(msg.get('content', ''))
 
-        # Only a user turn can carry pictures.
-        attachments = []
-        if image_urls and role == 'user':
-            for url in image_urls:
-                info = upload_image(token, url)
-                if info:
-                    attachments.append(info)
+        # Only a user turn can carry pictures. Build the parts list in the
+        # caller's own order so a prompt written as
+        # [text, image, text, image] reaches ChatGPT that way round.
+        attachments, parts = [], []
+        if role == 'user' and any(kind == 'image' for kind, _ in items):
+            for kind, value in items:
+                if kind == 'text':
+                    parts.append(value)
+                    continue
+                info = upload_image(token, value)
+                if not info:
+                    continue          # unreadable or oversized; already logged
+                attachments.append(info)
+                parts.append({
+                    'content_type': 'image_asset_pointer',
+                    'asset_pointer': f"file-service://{info['file_id']}",
+                    'size_bytes': info['size'],
+                    'width': info['width'],
+                    'height': info['height'],
+                })
+
+            # The turn needs a trailing string part even when the caller sent
+            # nothing but pictures.
+            if not parts or not isinstance(parts[-1], str):
+                parts.append(content if not any(isinstance(p, str) for p in parts) else '')
 
         metadata = {
             'developer_mode_connector_ids': [],
@@ -668,16 +706,6 @@ def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
         }
 
         if attachments:
-            # An image turn is multimodal_text: pointer parts first, then the
-            # prompt as the trailing string part.
-            parts = [{
-                'content_type': 'image_asset_pointer',
-                'asset_pointer': f"file-service://{a['file_id']}",
-                'size_bytes': a['size'],
-                'width': a['width'],
-                'height': a['height'],
-            } for a in attachments]
-            parts.append(content)
             message_content = {'content_type': 'multimodal_text', 'parts': parts}
             metadata['attachments'] = [{
                 'id': a['file_id'], 'name': a['name'], 'mimeType': a['mime'],
@@ -901,6 +929,8 @@ def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
     # Hard delete conversation (not just hide)
     final_conv_id = response_conversation_id or conversation_id
     if final_conv_id and not conversation_id:
+        if final_conv_id not in undeleted_conversations:
+            undeleted_conversations.append(final_conv_id)
         try:
             headers = {
                 **base_headers(),
@@ -916,7 +946,12 @@ def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
                 json={'is_visible': False},
                 timeout=10,
             )
-            if resp.status_code != 200:
+            # A temporary chat leaves no conversation behind, so 404 here is the
+            # normal outcome for an ordinary text turn, not a failure.
+            if resp.status_code in (200, 404):
+                if final_conv_id in undeleted_conversations:
+                    undeleted_conversations.remove(final_conv_id)
+            else:
                 print(f"[http-helper] delete failed: {resp.status_code} "
                       f"{resp.text[:120]}", flush=True)
         except Exception as e:
@@ -958,6 +993,7 @@ class ChatGPTHandler(BaseHTTPRequestHandler):
                 'session_cookies': get_cookie_count(),
                 'cookie_updates': cookie_update_count,
                 'last_cookie_update_secs_ago': cookie_age,
+                'undeleted_conversations': list(undeleted_conversations),
             }).encode())
             return
         

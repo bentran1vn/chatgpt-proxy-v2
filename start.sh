@@ -9,10 +9,34 @@
 
 cd "$(dirname "$0")"
 
-# Kill existing processes
-pkill -f "chatgpt-http-helper.py" 2>/dev/null
+# Kill existing processes.
+#
+# The helper ignores SIGTERM in practice: its handler calls server.shutdown()
+# from inside the signal handler while serve_forever() is blocking the same
+# thread, which deadlocks. A plain pkill therefore left the old helper holding
+# port 1436 and the new one died with "Address already in use". Escalate.
 pkill -f "bun.*proxy.ts" 2>/dev/null
-sleep 1
+pkill -f "chatgpt-http-helper.py" 2>/dev/null
+for _ in 1 2 3; do
+  pgrep -f "chatgpt-http-helper.py" >/dev/null 2>&1 || break
+  sleep 1
+done
+if pgrep -f "chatgpt-http-helper.py" >/dev/null 2>&1; then
+  echo "Previous helper ignored SIGTERM, forcing..."
+  pkill -9 -f "chatgpt-http-helper.py" 2>/dev/null
+  sleep 1
+fi
+
+# Anything else still sitting on the ports (a stray python -m http.server, an
+# editor's live preview) would fail the bind just as loudly, so say so plainly.
+for port in 1435 1436; do
+  holder=$(lsof -ti tcp:"$port" -s tcp:LISTEN 2>/dev/null | head -1)
+  if [ -n "$holder" ]; then
+    echo "Port $port is still held by PID $holder ($(ps -p "$holder" -o comm= 2>/dev/null))."
+    echo "Stop it first:  kill -9 $holder"
+    exit 1
+  fi
+done
 
 # Start the HTTP helper first (needs time to warm up)
 echo "Starting ChatGPT HTTP helper..."

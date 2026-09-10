@@ -6,3 +6,9 @@ __pycache__/
 bun.lock
 .venv/
 .generated_images/
+
+# Deployment env files (only .docker/.env.example is tracked)
+.docker/.env
+.docker/.env.*
+!.docker/.env.example
+logs/

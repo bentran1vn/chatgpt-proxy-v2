@@ -1,0 +1,70 @@
+# Profile-based compose used by CI/CD. Only one environment exists here — prod,
+# deployed from main — so the profiles are a thin wrapper rather than the
+# dev/prod split hoatheomua-be needs. There is no database and no broker: the
+# proxy keeps its whole state (session cookies, generated images) in one volume.
+#
+#   docker compose -f .docker/compose.yaml --profile prod up -d
+x-proxy-env: &proxy-env
+  TZ: ${TZ:-Asia/Bangkok}
+  NODE_ENV: production
+
+  # Bind on all interfaces: proxy.ts defaults to 127.0.0.1, which inside a
+  # container would only ever be reachable from the container itself.
+  HOST: 0.0.0.0
+  PORT: 1435
+  CHATGPT_BRIDGE_PORT: 1436
+
+  # Session cookies + generated images live on the mounted volume, not in /app.
+  CHATGPT_DATA_DIR: /data
+
+  # Fallback backend for every model that is not chatgpt/*. Optional — leave
+  # UPSTREAM_KEY empty when the upstream is local or absent.
+  UPSTREAM_URL: ${UPSTREAM_URL:-http://127.0.0.1:8080/v1}
+  UPSTREAM_KEY: ${UPSTREAM_KEY:-}
+
+  # ChatGPT web credentials, copied out of a logged-in chatgpt.com session.
+  # CHATGPT_ACCESS_TOKEN is an RS256 JWT that lapses after ~10 days: rotating it
+  # is a secret update + redeploy, not a code change.
+  CHATGPT_COOKIES: ${CHATGPT_COOKIES}
+  CHATGPT_ACCESS_TOKEN: ${CHATGPT_ACCESS_TOKEN}
+
+  # Public base for the /files/ links handed back with generated images. Must be
+  # the URL clients see, not the container's own port.
+  CHATGPT_FILES_BASE: ${CHATGPT_FILES_BASE:-http://127.0.0.1:1435}
+  CHATGPT_NEVER_STORE: ${CHATGPT_NEVER_STORE:-0}
+
+services:
+  chatgpt-proxy-prod:
+    image: ${REGISTRY}/chatgpt-proxy:${TAG:-latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    container_name: chatgpt-proxy-prod
+    hostname: chatgpt-proxy-prod
+    environment:
+      <<: *proxy-env
+    ports:
+      - "${HTTP_PORT:-1435}:1435"
+    # Joins both hoatheomua-be networks so either API environment can reach the
+    # proxy at http://chatgpt-proxy-prod:1435/v1 without going out through the
+    # published host port.
+    networks: [hoatheomua-network-dev, hoatheomua-network-prod]
+    volumes:
+      - chatgpt-proxy-data-prod:/data
+    profiles: [prod, api-prod, api, prod-pull]
+
+volumes:
+  chatgpt-proxy-data-prod:
+    name: chatgpt-proxy-data-prod
+    driver: local
+
+networks:
+  # Created and owned by hoatheomua-be's compose; declared external so this
+  # stack attaches to them instead of making a second pair of its own.
+  hoatheomua-network-dev:
+    name: hoatheomua-network-dev
+    external: true
+  hoatheomua-network-prod:
+    name: hoatheomua-network-prod
+    external: true

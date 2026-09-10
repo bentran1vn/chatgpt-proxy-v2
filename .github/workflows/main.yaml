@@ -1,0 +1,97 @@
+name: Deploy ChatGPT Proxy
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+jobs:
+  build-application:
+    name: Build / Proxy
+    uses: ./.github/workflows/build-image.yaml
+    permissions:
+      contents: read
+      packages: write
+    secrets: inherit
+    with:
+      actor: ${{ github.actor }}
+      repository: ${{ github.repository }}
+
+  deploy-proxy-prod:
+    name: Deploy / Prod / Proxy
+    needs: build-application
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/deploy-application.yaml
+    with:
+      actor: ${{ github.actor }}
+      repository: ${{ github.repository }}
+      profile: prod
+      environment: prod
+      tag: prod-latest
+      run-on: hoatheomua
+      pull-profile: prod-pull
+    secrets: inherit
+
+  notify-discord:
+    name: Notify / Discord / CI-CD
+    runs-on: ubuntu-latest
+    env:
+      DISCORD_CI_WEBHOOK_URL: ${{ secrets.DISCORD_CI_WEBHOOK_URL }}
+    needs:
+      - build-application
+      - deploy-proxy-prod
+    if: ${{ always() }}
+    steps:
+      - name: Build notification payload
+        id: payload
+        shell: bash
+        run: |
+          BUILD_RESULT="${{ needs.build-application.result }}"
+          TARGET_ENV="prod"
+          DEPLOY_RESULT="${{ needs.deploy-proxy-prod.result }}"
+
+          STATUS_EMOJI="✅"
+          STATUS_TEXT="Success"
+          if [[ "$BUILD_RESULT" != "success" || "$DEPLOY_RESULT" != "success" ]]; then
+            STATUS_EMOJI="❌"
+            STATUS_TEXT="Failed"
+          fi
+
+          RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          CONTENT=$(jq -n \
+            --arg statusEmoji "$STATUS_EMOJI" \
+            --arg statusText "$STATUS_TEXT" \
+            --arg repo "${{ github.repository }}" \
+            --arg branch "${{ github.ref_name }}" \
+            --arg actor "${{ github.actor }}" \
+            --arg build "$BUILD_RESULT" \
+            --arg deploy "$DEPLOY_RESULT" \
+            --arg env "$TARGET_ENV" \
+            --arg runUrl "$RUN_URL" \
+            '{content: ($statusEmoji + " **ChatGPT Proxy CI/CD " + $statusText + "**\n"
+              + "- Repository: `" + $repo + "`\n"
+              + "- Branch: `" + $branch + "`\n"
+              + "- Triggered by: `" + $actor + "`\n"
+              + "- Build: `" + $build + "`\n"
+              + "- Deploy Env: `" + $env + "`\n"
+              + "- Deploy: `" + $deploy + "`\n"
+              + "- Run: " + $runUrl)}')
+
+          {
+            echo "content<<EOF"
+            echo "$CONTENT"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Send notification to Discord
+        if: ${{ env.DISCORD_CI_WEBHOOK_URL != '' }}
+        run: |
+          curl -sS -X POST "${{ env.DISCORD_CI_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d '${{ steps.payload.outputs.content }}'
+
+      - name: Skip notification (webhook not configured)
+        if: ${{ env.DISCORD_CI_WEBHOOK_URL == '' }}
+        run: echo "DISCORD_CI_WEBHOOK_URL is empty. Skipping Discord notification."

@@ -1,0 +1,54 @@
+# Standalone compose for local use — same single prod service as compose.yaml,
+# but building from source and on its own network, so it runs on a machine that
+# has no hoatheomua-be stack.
+#   docker compose -f .docker/docker-compose.yml --env-file .docker/.env up -d --build
+# CI/CD uses the profile-based .docker/compose.yaml instead.
+services:
+  chatgpt-proxy:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    container_name: chatgpt-proxy
+    ports:
+      - "${HTTP_PORT:-1435}:1435"
+    environment:
+      TZ: ${TZ:-Asia/Bangkok}
+      NODE_ENV: production
+
+      # proxy.ts binds 127.0.0.1 unless HOST says otherwise, which inside a
+      # container means "unreachable from the host".
+      HOST: 0.0.0.0
+      PORT: 1435
+      CHATGPT_BRIDGE_PORT: 1436
+      CHATGPT_DATA_DIR: /data
+
+      # Upstream backend for non-chatgpt/* models (optional)
+      UPSTREAM_URL: ${UPSTREAM_URL:-http://127.0.0.1:8080/v1}
+      UPSTREAM_KEY: ${UPSTREAM_KEY:-}
+
+      # ChatGPT web credentials (see .docker/.env.example for where to copy them from)
+      CHATGPT_COOKIES: ${CHATGPT_COOKIES}
+      CHATGPT_ACCESS_TOKEN: ${CHATGPT_ACCESS_TOKEN}
+
+      # Public base for /files/ links returned with generated images
+      CHATGPT_FILES_BASE: ${CHATGPT_FILES_BASE:-http://127.0.0.1:1435}
+      CHATGPT_NEVER_STORE: ${CHATGPT_NEVER_STORE:-0}
+    networks:
+      - chatgpt-proxy-network
+    volumes:
+      # Keeps .cookies.json and the generated images across rebuilds; losing the
+      # cookie jar means every restart re-handshakes chatgpt.com from scratch.
+      - chatgpt-proxy-data:/data
+
+volumes:
+  chatgpt-proxy-data:
+    name: chatgpt-proxy-data
+    driver: local
+
+networks:
+  chatgpt-proxy-network:
+    name: chatgpt-proxy-network
+    driver: bridge
+    ipam:
+      driver: default

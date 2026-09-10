@@ -184,6 +184,18 @@ async function sendToHelper(opts: {
   return helperRes.json();
 }
 
+// Text of a message whose content may be a string or an array of parts.
+function contentText(content: any): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((p: any) => p?.type === "text")
+      .map((p: any) => p.text || "")
+      .join("\n");
+  }
+  return content ? JSON.stringify(content) : "";
+}
+
 function truncateContent(content: string, maxChars: number): string {
   if (content.length <= maxChars) return content;
   return content.slice(0, maxChars) + `\n\n[... truncated, showing first ${maxChars} chars of ${content.length} total]`;
@@ -217,15 +229,22 @@ function buildResponse(requestId: string, created: number, model: string, text: 
 }
 
 async function ensureHelper(): Promise<void> {
-  if (helperReady) {
-    try {
-      const res = await fetch(`${HELPER_URL}/health`, { signal: AbortSignal.timeout(2000) });
-      if (res.ok) return;
-    } catch {
-      helperReady = false;
+  // Probe before spawning, always. This used to be guarded by `helperReady`,
+  // which is false on the first request - so a helper already started by
+  // start.sh was never noticed, and we spawned a second one that lost the race
+  // for port 1436 and died with a noisy "Address already in use" traceback.
+  try {
+    const res = await fetch(`${HELPER_URL}/health`, { signal: AbortSignal.timeout(2000) });
+    if (res.ok) {
+      if (!helperReady) console.log("[chatgpt] Reusing running HTTP helper");
+      helperReady = true;
+      return;
     }
+  } catch {
+    helperReady = false;
   }
-  
+
+
   if (helperStarting) {
     await helperStarting;
     return;
@@ -315,13 +334,24 @@ export async function handleChatGPTRequest(body: any): Promise<Response> {
   try {
     await ensureHelper();
 
-    console.log(`[chatgpt] → ${slug} (${body.messages?.length || 0} messages, first msg ${(body.messages?.[0]?.content || "").length} chars)`);
-    
-    // Debug: log first 200 chars of first message
-    if (body.messages?.[0]) {
-      console.log(`[chatgpt] First msg role=${body.messages[0].role}, content preview: ${(body.messages[0].content || "").slice(0, 200)}`);
+    // A message's content may be an array of parts. Calling .length/.slice on
+    // it straight reported the part COUNT as a character count and printed
+    // "[object Object],[object Object]" as the preview.
+    const first = body.messages?.[0];
+    const firstText = contentText(first?.content);
+    const imgCount = Array.isArray(first?.content)
+      ? first.content.filter((p: any) => p?.type === "image_url").length
+      : 0;
+
+    console.log(`[chatgpt] → ${slug} (${body.messages?.length || 0} messages, `
+      + `first msg ${firstText.length} chars`
+      + (imgCount ? `, ${imgCount} image${imgCount > 1 ? "s" : ""}` : "") + `)`);
+
+    if (first) {
+      console.log(`[chatgpt] First msg role=${first.role}, content preview: ${firstText.slice(0, 200)}`);
     }
-    
+
+
     const helperRes = await fetch(`${HELPER_URL}/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

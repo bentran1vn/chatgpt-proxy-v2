@@ -178,32 +178,28 @@ fi
 
 if want 10; then
 head_ 10 "No conversations left behind"
-  out=$($PY - <<'PY' 2>/dev/null
-import io, importlib.util, datetime, contextlib
-spec = importlib.util.spec_from_file_location('h', 'chatgpt-http-helper.py')
-h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
-# The helper narrates its startup on stdout; keep it out of the report.
-with contextlib.redirect_stdout(io.StringIO()):
-    h.init_session(); tok = h.refresh_access_token()
-H = {**h.base_headers(), 'Authorization': f'Bearer {tok}'}
-r = h.session.get(f'{h.CHATGPT_BASE}/backend-api/conversations?offset=0&limit=20',
-                  headers=H, timeout=30)
-cut = (datetime.datetime.now(datetime.timezone.utc)
-       - datetime.timedelta(minutes=30)).strftime('%Y-%m-%dT%H:%M')
-recent = [i for i in r.json().get('items', []) if i.get('create_time', '') > cut]
-print(len(recent))
-for i in recent[:5]:
-    print('  -', i.get('title'))
-PY
-)
+  # Ask the helper what IT created and failed to delete. Scanning the account's
+  # own conversation list instead would flag whatever the user happens to be
+  # doing in their browser right now, which is not this proxy's doing.
+  out=$(curl -s --max-time 10 "$HELPER/health" \
+        | $PY -c 'import json,sys
+d = json.load(sys.stdin)
+ids = d.get("undeleted_conversations")
+if ids is None:
+    print("UNSUPPORTED")
+else:
+    print(len(ids))
+    for i in ids[:5]:
+        print("  -", i)' 2>/dev/null)
   n=$(printf '%s' "$out" | head -1)
-  if [ "${n:-x}" = "0" ]; then
-    ok "nothing from the last 30 minutes"
-  elif [ -n "$n" ]; then
-    no "$n recent conversation(s) survived:"; printf '%s\n' "$out" | tail -n +2
-  else
-    warn "could not check (token expired?)"
-  fi
+  case "$n" in
+    0)           ok "helper deleted every conversation it created" ;;
+    UNSUPPORTED) warn "helper predates the undeleted_conversations field" ;;
+    "")          warn "could not reach the helper" ;;
+    *)           no "$n conversation(s) the proxy created still exist:"
+                 printf '%s\n' "$out" | tail -n +2
+                 note "delete by hand: PATCH /backend-api/conversation/<id> {\"is_visible\": false}" ;;
+  esac
 fi
 
 printf '\n%s%d passed%s' "$GRN" "$pass" "$OFF"
