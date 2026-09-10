@@ -140,11 +140,27 @@ function sseFromText(response: any): Response {
 // ── Smart Compression for ChatGPT web (which has message length limits) ──
 const CHATGPT_MAX_CHARS = 50000; // safe limit for ChatGPT web per-conversation
 
+// Text length of a message. Image parts are excluded on purpose: they are
+// uploaded to ChatGPT separately, so their base64 never counts against the
+// message budget - and stringifying a data: URI here would make every image
+// request look enormous and trigger compression that destroys it.
+function contentText(content: any): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((p: any) => p?.type === "text")
+      .map((p: any) => p.text || "")
+      .join("\n");
+  }
+  return JSON.stringify(content || "");
+}
+
+function hasImages(content: any): boolean {
+  return Array.isArray(content) && content.some((p: any) => p?.type === "image_url");
+}
+
 function estimateChars(messages: any[]): number {
-  return messages.reduce((sum: number, m: any) => {
-    const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content || "");
-    return sum + content.length;
-  }, 0);
+  return messages.reduce((sum: number, m: any) => sum + contentText(m.content).length, 0);
 }
 
 function compressToolsForChatGPT(tools: any[]): any[] {
@@ -204,8 +220,17 @@ function compressMessagesForChatGPT(messages: any[], maxChars: number): any[] {
   
   for (let i = nonSystem.length - 1; i >= 0; i--) {
     const msg = nonSystem[i];
+
+    // Messages carrying images pass through untouched - flattening them to a
+    // string would drop the picture and paste raw base64 into the prompt.
+    if (hasImages(msg.content)) {
+      kept.unshift(msg);
+      totalChars += contentText(msg.content).length;
+      continue;
+    }
+
     let content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "");
-    
+
     // Truncate individual tool results that are huge
     if (msg.role === "tool" && content.length > 3000) {
       content = content.slice(0, 3000) + "\n[... output truncated ...]";
@@ -301,7 +326,15 @@ async function handleChatGPTWithTools(body: any): Promise<Response> {
   const userIdx = messages.findIndex((m: any) => m.role === "user");
   if (userIdx >= 0) {
     const prefix = (systemContent ? systemContent + "\n\n" : "") + toolPrompt + "\n\n---\n\n";
-    messages[userIdx] = { ...messages[userIdx], content: prefix + messages[userIdx].content };
+    const existing = messages[userIdx].content;
+    messages[userIdx] = {
+      ...messages[userIdx],
+      // Concatenating onto an array would stringify it as "[object Object]"
+      // and lose the image, so prepend a text part instead.
+      content: Array.isArray(existing)
+        ? [{ type: "text", text: prefix }, ...existing]
+        : prefix + existing,
+    };
   } else {
     // No user message — create one with system + tools
     messages.push({ role: "user", content: (systemContent ? systemContent + "\n\n" : "") + toolPrompt });
@@ -484,6 +517,13 @@ const server = Bun.serve({
           object: "list",
           data: [...upstreamModels, ...chatgptModels],
         });
+      }
+
+      // Generated images live on the helper; forward so callers only ever
+      // need to know about this port. Must sit above the upstream catch-all.
+      if (path.startsWith("/files/") && req.method === "GET") {
+        const helperPort = process.env.CHATGPT_BRIDGE_PORT || "1436";
+        return fetch(`http://127.0.0.1:${helperPort}${path}`);
       }
 
       if (path === "/health" || path === "/") {

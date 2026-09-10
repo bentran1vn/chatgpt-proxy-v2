@@ -40,7 +40,9 @@ echo "  → Helper: http://127.0.0.1:1436"
 echo "  → PIDs:   proxy=$PROXY_PID helper=$HELPER_PID"
 echo ""
 
-# Wait for either to exit
-wait -n $HELPER_PID $PROXY_PID
+# Wait for either to exit (portable: macOS ships bash 3.2, which has no `wait -n`)
+while kill -0 $HELPER_PID 2>/dev/null && kill -0 $PROXY_PID 2>/dev/null; do
+  sleep 1
+done
 echo "Process exited, shutting down..."
 kill $HELPER_PID $PROXY_PID 2>/dev/null

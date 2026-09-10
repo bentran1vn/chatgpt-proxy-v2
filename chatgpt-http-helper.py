@@ -9,7 +9,7 @@ Runs as a lightweight HTTP server on port 1436.
 The TypeScript provider calls this for all chatgpt.com requests.
 """
 
-import json, sys, os, time, hashlib, base64, uuid, signal, random
+import json, sys, os, re, time, struct, hashlib, base64, uuid, signal, random
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 import threading
@@ -26,6 +26,27 @@ IMPERSONATE = "safari17_0"
 CHATGPT_BASE = "https://chatgpt.com"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIE_FILE = os.path.join(SCRIPT_DIR, '.cookies.json')
+IMAGE_DIR = os.path.join(SCRIPT_DIR, '.generated_images')
+
+# Generated images are handed back as markdown links rather than inline base64:
+# a 2MB PNG becomes ~2.8MB of base64 and chokes most OpenAI clients. Points at
+# the proxy, which forwards /files/ through to this helper.
+FILES_BASE = os.environ.get('CHATGPT_FILES_BASE', 'http://127.0.0.1:1435')
+
+# Image generation is unavailable in a temporary chat, which is what
+# history_and_training_disabled=True creates. Rather than dropping temporary
+# mode for every request, only the ones that actually ask for a picture opt
+# out of it - so ordinary chat still leaves nothing behind on the account.
+# Set CHATGPT_NEVER_STORE=1 to keep temporary mode on unconditionally and give
+# up image generation entirely.
+NEVER_STORE = os.environ.get('CHATGPT_NEVER_STORE', '').strip() not in ('', '0', 'false')
+IMAGE_INTENT_TERMS = (
+    'vẽ ', 'vẽ cho', 'tạo ảnh', 'tạo hình', 'tạo bức', 'tạo cho tôi một bức',
+    'hình ảnh về', 'ảnh về', 'minh hoạ', 'minh họa',
+    'generate an image', 'generate image', 'create an image', 'create image',
+    'make an image', 'make me an image', 'draw ', 'picture of', 'image of',
+    'an illustration', 'photo of',
+)
 
 # ── State ──
 access_token = None
@@ -174,12 +195,60 @@ def base_headers():
     }
 
 # ── Auth ──
+def load_token_from_env():
+    """Read CHATGPT_ACCESS_TOKEN from the environment or .env.
+
+    As of Sep 2026 /api/auth/session no longer returns an accessToken — it
+    replies with a WARNING_BANNER and nothing else. The token now comes from
+    auth.openai.com and is only reachable from a real browser session, so it
+    has to be supplied out of band. Copy it out of DevTools (the Authorization
+    header on any /backend-api/ request) and paste it into .env. It is an
+    RS256 JWT that lives ~10 days.
+    """
+    tok = os.environ.get('CHATGPT_ACCESS_TOKEN', '').strip()
+    if not tok:
+        env_file = os.path.join(SCRIPT_DIR, '.env')
+        if os.path.exists(env_file):
+            with open(env_file) as f:
+                for line in f:
+                    if line.startswith('CHATGPT_ACCESS_TOKEN='):
+                        tok = line.split('=', 1)[1].strip()
+                        break
+    return tok.removeprefix('Bearer ').strip()
+
+
+def token_expiry(tok):
+    """Unix expiry from the JWT payload, or 0 if it cannot be parsed."""
+    try:
+        payload = tok.split('.')[1]
+        claims = json.loads(base64.urlsafe_b64decode(payload + '=' * (-len(payload) % 4)))
+        return int(claims.get('exp', 0))
+    except Exception:
+        return 0
+
+
 def refresh_access_token():
     global access_token, token_expires_at
     now = time.time()
     if access_token and now < token_expires_at:
         return access_token
-    
+
+    tok = load_token_from_env()
+    if tok:
+        exp = token_expiry(tok)
+        if exp and exp <= now:
+            raise Exception(
+                f"CHATGPT_ACCESS_TOKEN expired {(now - exp) / 3600:.1f}h ago — "
+                "copy a fresh one from DevTools into .env"
+            )
+        access_token = tok
+        # Re-read from .env a little before the JWT itself lapses, so a token
+        # swapped in on disk is picked up without restarting the helper.
+        token_expires_at = min(exp - 300, now + 20 * 60) if exp else now + 20 * 60
+        hours_left = (exp - now) / 3600 if exp else 0
+        print(f"[http-helper] Access token from .env ✓ (expires in {hours_left:.1f}h)", flush=True)
+        return access_token
+
     print("[http-helper] Fetching access token...", flush=True)
     r = session.get(
         f'{CHATGPT_BASE}/api/auth/session',
@@ -205,7 +274,11 @@ def refresh_access_token():
     
     data = r.json()
     if 'accessToken' not in data:
-        raise Exception(f"No accessToken in response: {json.dumps(data)[:200]}")
+        raise Exception(
+            "No accessToken in /api/auth/session response (keys: "
+            f"{list(data.keys())}). OpenAI removed the token from this endpoint; "
+            "set CHATGPT_ACCESS_TOKEN in .env instead."
+        )
     
     access_token = data['accessToken']
     token_expires_at = now + 20 * 60  # Refresh every 20 min
@@ -345,35 +418,282 @@ def get_chat_requirements(token):
     return r.json()
 
 # ── Conversation ──
+# GenUI widgets are delivered inline in the text part, fenced by private-use
+# codepoints: U+E200 "genui" U+E202 {json} U+E201. They render as interactive
+# cards in the web app but are just noise over an OpenAI-shaped API, so strip
+# them. If a reply is nothing but a widget, keep the raw text rather than
+# handing the caller an empty string.
+# A block runs from U+E200 to U+E201, with U+E202 separating the tag from the
+# payload: GenUI widgets (tag "genui") and inline citations (tag "cite")
+# both use it. Left in place they reach the caller as garbage like
+# "citeturn910647search0" glued onto the prose.
+INLINE_BLOCK = re.compile('\ue200[^\ue201]*\ue201', re.DOTALL)
+
+def strip_inline_blocks(text):
+    cleaned = INLINE_BLOCK.sub('', text)
+    # A block that was still streaming when the turn ended never gets its
+    # closing U+E201, so sweep up whatever markers remain.
+    cleaned = re.sub('[\ue200-\ue20f]', '', cleaned).strip()
+    # A reply that is nothing but a widget would otherwise come back empty.
+    return cleaned if cleaned else text
+
+
+# ── Image upload (vision input) ──
+# Uploads are keyed by content hash so the same picture re-sent across turns of
+# a conversation is registered with ChatGPT once.
+UPLOAD_CACHE = {}
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+
+def image_info(blob):
+    """(mime, width, height) for PNG/JPEG/GIF/WebP, or (None, 0, 0)."""
+    try:
+        if blob[:8] == b'\x89PNG\r\n\x1a\n':
+            w, hgt = struct.unpack('>II', blob[16:24])
+            return 'image/png', w, hgt
+        if blob[:3] == b'\xff\xd8\xff':
+            i = 2
+            while i < len(blob) - 9:
+                if blob[i] != 0xFF:
+                    i += 1
+                    continue
+                marker = blob[i + 1]
+                # SOF0-3, SOF5-7, SOF9-11, SOF13-15 carry the dimensions;
+                # DHT/DQT/SOS and the RSTn markers do not.
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                              0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    hgt, w = struct.unpack('>HH', blob[i + 5:i + 9])
+                    return 'image/jpeg', w, hgt
+                if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                i += 2 + struct.unpack('>H', blob[i + 2:i + 4])[0]
+            return 'image/jpeg', 0, 0
+        if blob[:6] in (b'GIF87a', b'GIF89a'):
+            w, hgt = struct.unpack('<HH', blob[6:10])
+            return 'image/gif', w, hgt
+        if blob[:4] == b'RIFF' and blob[8:12] == b'WEBP':
+            fmt = blob[12:16]
+            if fmt == b'VP8 ':
+                w, hgt = struct.unpack('<HH', blob[26:30])
+                return 'image/webp', w & 0x3FFF, hgt & 0x3FFF
+            if fmt == b'VP8L':
+                b = struct.unpack('<I', blob[21:25])[0]
+                return 'image/webp', (b & 0x3FFF) + 1, ((b >> 14) & 0x3FFF) + 1
+            if fmt == b'VP8X':
+                w = int.from_bytes(blob[24:27], 'little') + 1
+                hgt = int.from_bytes(blob[27:30], 'little') + 1
+                return 'image/webp', w, hgt
+            return 'image/webp', 0, 0
+    except Exception:
+        pass
+    return None, 0, 0
+
+
+def load_image(url):
+    """Raw bytes for a data: URI or an http(s) URL, or None."""
+    try:
+        if url.startswith('data:'):
+            header, _, payload = url.partition(',')
+            if ';base64' in header:
+                return base64.b64decode(payload)
+            from urllib.parse import unquote_to_bytes
+            return unquote_to_bytes(payload)
+        if url.startswith(('http://', 'https://')):
+            # Deliberately NOT the shared session: that jar holds chatgpt.com
+            # credentials and this URL is whatever the caller supplied.
+            r = cffi_requests.get(url, timeout=30)
+            return r.content if r.status_code == 200 else None
+    except Exception as e:
+        print(f"[http-helper] image load error: {e}", flush=True)
+    return None
+
+
+def upload_image(token, url):
+    """Register an image with ChatGPT. Returns an attachment dict or None."""
+    blob = load_image(url)
+    if not blob:
+        return None
+    if len(blob) > MAX_IMAGE_BYTES:
+        print(f"[http-helper] image too large ({len(blob)} bytes), skipping", flush=True)
+        return None
+
+    digest = hashlib.sha256(blob).hexdigest()
+    if digest in UPLOAD_CACHE:
+        return UPLOAD_CACHE[digest]
+
+    mime, width, height = image_info(blob)
+    if not mime:
+        print("[http-helper] unrecognised image format, skipping", flush=True)
+        return None
+
+    ext = mime.split('/')[1]
+    name = f'{digest[:16]}.{ext}'
+    auth = {**base_headers(), 'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json'}
+    try:
+        reg = session.post(f'{CHATGPT_BASE}/backend-api/files', headers=auth,
+                           json={'file_name': name, 'file_size': len(blob),
+                                 'use_case': 'multimodal'}, timeout=30)
+        if reg.status_code != 200:
+            print(f"[http-helper] file register {reg.status_code}: {reg.text[:150]}", flush=True)
+            return None
+        reg = reg.json()
+        file_id, upload_url = reg.get('file_id'), reg.get('upload_url')
+        if not (file_id and upload_url):
+            return None
+
+        # Blob storage, not chatgpt.com - no bearer token here.
+        put = session.put(upload_url, data=blob,
+                          headers={'x-ms-blob-type': 'BlockBlob',
+                                   'x-ms-version': '2020-04-08',
+                                   'Content-Type': mime}, timeout=120)
+        if put.status_code not in (200, 201):
+            print(f"[http-helper] blob upload {put.status_code}", flush=True)
+            return None
+
+        done = session.post(f'{CHATGPT_BASE}/backend-api/files/{file_id}/uploaded',
+                            headers=auth, json={}, timeout=30)
+        if done.status_code != 200:
+            print(f"[http-helper] file finalize {done.status_code}", flush=True)
+            return None
+
+        info = {'file_id': file_id, 'name': name, 'mime': mime,
+                'size': len(blob), 'width': width, 'height': height}
+        UPLOAD_CACHE[digest] = info
+        print(f"[http-helper] uploaded image {name} ({width}x{height}, {len(blob)} bytes)",
+              flush=True)
+        return info
+    except Exception as e:
+        print(f"[http-helper] image upload error: {e}", flush=True)
+        return None
+
+
+def split_content(content):
+    """Split OpenAI-style content into (text, [image urls])."""
+    if not isinstance(content, list):
+        return (content if isinstance(content, str) else json.dumps(content)), []
+    texts, urls = [], []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get('type') == 'text':
+            texts.append(part.get('text', ''))
+        elif part.get('type') == 'image_url':
+            url = (part.get('image_url') or {}).get('url', '')
+            if url:
+                urls.append(url)
+    return '\n'.join(texts), urls
+
+
+def message_text(msg):
+    """Flatten a message's content down to plain text."""
+    content = msg.get('content', '')
+    if isinstance(content, list):
+        return '\n'.join(
+            p.get('text', '') for p in content
+            if isinstance(p, dict) and p.get('type') == 'text'
+        )
+    return content if isinstance(content, str) else json.dumps(content)
+
+
+def wants_image(messages):
+    """True when the newest user turn reads like a request for a picture."""
+    if NEVER_STORE:
+        return False
+    for msg in reversed(messages):
+        if msg.get('role') == 'user':
+            text = message_text(msg).lower()
+            return any(term in text for term in IMAGE_INTENT_TERMS)
+    return False
+
+
+def download_asset(token, pointer):
+    """Fetch a generated image and save it under IMAGE_DIR.
+
+    Must run BEFORE the conversation is deleted - the download URL 404s once
+    the conversation holding the asset is gone.
+    """
+    file_id = pointer.split('://', 1)[-1]
+    auth = {**base_headers(), 'Authorization': f'Bearer {token}'}
+    try:
+        meta = session.get(f'{CHATGPT_BASE}/backend-api/files/{file_id}/download',
+                           headers=auth, timeout=30)
+        if meta.status_code != 200:
+            print(f"[http-helper] asset metadata {meta.status_code} for {file_id}", flush=True)
+            return None
+        url = meta.json().get('download_url')
+        if not url:
+            return None
+
+        blob = session.get(url, headers=auth, timeout=120)
+        if blob.status_code != 200 or len(blob.content) < 100:
+            print(f"[http-helper] asset fetch {blob.status_code} for {file_id}", flush=True)
+            return None
+
+        os.makedirs(IMAGE_DIR, exist_ok=True)
+        name = f'{file_id}.png'
+        with open(os.path.join(IMAGE_DIR, name), 'wb') as f:
+            f.write(blob.content)
+        print(f"[http-helper] saved image {name} ({len(blob.content)} bytes)", flush=True)
+        return name
+    except Exception as e:
+        print(f"[http-helper] asset download error: {e}", flush=True)
+        return None
+
+
 def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
-                      conversation_id=None, parent_message_id=None):
+                      conversation_id=None, parent_message_id=None, allow_history=False):
     chatgpt_messages = []
     for msg in messages:
         role = msg.get('role', 'user')
-        content = msg.get('content', '')
-        if isinstance(content, list):
-            text_parts = [p.get('text', '') for p in content if p.get('type') == 'text']
-            content = '\n'.join(text_parts) if text_parts else json.dumps(content)
-        
+        content, image_urls = split_content(msg.get('content', ''))
+
+        # Only a user turn can carry pictures.
+        attachments = []
+        if image_urls and role == 'user':
+            for url in image_urls:
+                info = upload_image(token, url)
+                if info:
+                    attachments.append(info)
+
+        metadata = {
+            'developer_mode_connector_ids': [],
+            'selected_connector_ids': [],
+            'selected_sync_knowledge_store_ids': [],
+            'selected_sources': [],
+            'selected_github_repos': [],
+            'selected_all_github_repos': False,
+            'serialization_metadata': {'custom_symbol_offsets': []},
+        }
+
+        if attachments:
+            # An image turn is multimodal_text: pointer parts first, then the
+            # prompt as the trailing string part.
+            parts = [{
+                'content_type': 'image_asset_pointer',
+                'asset_pointer': f"file-service://{a['file_id']}",
+                'size_bytes': a['size'],
+                'width': a['width'],
+                'height': a['height'],
+            } for a in attachments]
+            parts.append(content)
+            message_content = {'content_type': 'multimodal_text', 'parts': parts}
+            metadata['attachments'] = [{
+                'id': a['file_id'], 'name': a['name'], 'mimeType': a['mime'],
+                'size': a['size'], 'width': a['width'], 'height': a['height'],
+            } for a in attachments]
+        else:
+            message_content = {'content_type': 'text', 'parts': [content]}
+
         chatgpt_messages.append({
             'id': str(uuid.uuid4()),
             'author': {'role': role},
             'create_time': time.time(),
-            'content': {
-                'content_type': 'text',
-                'parts': [content if isinstance(content, str) else json.dumps(content)]
-            },
-            'metadata': {
-                'developer_mode_connector_ids': [],
-                'selected_connector_ids': [],
-                'selected_sync_knowledge_store_ids': [],
-                'selected_sources': [],
-                'selected_github_repos': [],
-                'selected_all_github_repos': False,
-                'serialization_metadata': {'custom_symbol_offsets': []},
-            }
+            'content': message_content,
+            'metadata': metadata,
         })
-    
+
     body = {
         'action': 'next',
         'messages': chatgpt_messages,
@@ -399,7 +719,9 @@ def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
         },
         'paragen_cot_summary_display_override': 'allow',
         'force_parallel_switch': 'auto',
-        'history_and_training_disabled': True,
+        # Turning this off is what unlocks the image tool; the conversation is
+        # then stored on the account (and hard-deleted again below).
+        'history_and_training_disabled': not allow_history,
     }
 
     if conversation_id:
@@ -472,6 +794,7 @@ def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
     last_path = ""  # Track last path for v1 delta encoding
     is_assistant_msg = False
     assistant_message_id = ""
+    asset_pointers = []  # Generated images, collected in arrival order
     
     for line in r.text.split('\n'):
         line = line.strip()
@@ -508,6 +831,16 @@ def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
                     is_assistant_msg = (role == 'assistant')
                     if is_assistant_msg and msg.get('id'):
                         assistant_message_id = msg['id']
+
+                    # A generated image arrives on its own message authored by
+                    # role "tool", so this cannot be limited to assistant turns.
+                    # It must skip "user" though: an image WE uploaded is echoed
+                    # back in the stream and would otherwise be handed back as
+                    # if the model had just drawn it.
+                    if role != 'user':
+                        for part in msg.get('content', {}).get('parts', []):
+                            if isinstance(part, dict) and part.get('asset_pointer'):
+                                asset_pointers.append(part['asset_pointer'])
                     if is_assistant_msg:
                         parts = msg.get('content', {}).get('parts', [])
                         if parts and isinstance(parts[0], str):
@@ -526,12 +859,19 @@ def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
                 if last_path == '/message/content/parts/0' and is_assistant_msg:
                     full_text += parsed['v']
             
-            # Patch with batched ops
-            if isinstance(parsed, dict) and parsed.get('o') == 'patch' and isinstance(parsed.get('v'), list):
+            # Batched ops. These arrive either spelled out as
+            # {"o":"patch","v":[...]} or, for every batch after the first, as
+            # the shorthand {"v":[...]} that inherits the previous op type.
+            # Only the first form was handled, so a reply was truncated to
+            # whatever landed in the opening batch - usually a few characters.
+            if (isinstance(parsed, dict) and isinstance(parsed.get('v'), list)
+                    and parsed.get('o') in (None, 'patch')):
                 for op in parsed['v']:
                     if isinstance(op, dict):
                         if op.get('o') == 'append' and op.get('p') == '/message/content/parts/0':
                             full_text += str(op.get('v', ''))
+                            # Shorthand string deltas that follow inherit this path.
+                            last_path = op['p']
             
             # Legacy format: direct message object
             if isinstance(parsed, dict) and 'message' in parsed and 'v' not in parsed:
@@ -546,6 +886,18 @@ def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
         except (json.JSONDecodeError, TypeError, AttributeError):
             continue
     
+    # Pull generated images down BEFORE the conversation is deleted - the
+    # download URL 404s the moment the conversation holding the asset is gone.
+    images = []
+    for pointer in asset_pointers:
+        name = download_asset(token, pointer)
+        if name:
+            images.append(name)
+
+    if images:
+        links = '\n\n'.join(f'![generated image]({FILES_BASE}/files/{n})' for n in images)
+        full_text = f'{full_text}\n\n{links}'.strip() if full_text else links
+
     # Hard delete conversation (not just hide)
     final_conv_id = response_conversation_id or conversation_id
     if final_conv_id and not conversation_id:
@@ -555,27 +907,27 @@ def send_conversation(token, model_slug, messages, sentinel_token, proof_token,
                 'Authorization': f'Bearer {token}',
                 'Content-Type': 'application/json',
             }
-            # Step 1: Archive it
-            session.patch(
+            # DELETE on this resource now answers 405 with "Allow: PATCH", so
+            # the old archive-then-delete pair silently left every conversation
+            # sitting in the account. Deletion is a PATCH of is_visible.
+            resp = session.patch(
                 f'{CHATGPT_BASE}/backend-api/conversation/{final_conv_id}',
                 headers=headers,
-                json={'is_archived': True},
-                timeout=5,
+                json={'is_visible': False},
+                timeout=10,
             )
-            # Step 2: Hard delete
-            session.delete(
-                f'{CHATGPT_BASE}/backend-api/conversation/{final_conv_id}',
-                headers=headers,
-                timeout=5,
-            )
-        except:
-            pass
+            if resp.status_code != 200:
+                print(f"[http-helper] delete failed: {resp.status_code} "
+                      f"{resp.text[:120]}", flush=True)
+        except Exception as e:
+            print(f"[http-helper] delete error: {e}", flush=True)
     
     return {
         'error': False,
-        'text': full_text,
+        'text': strip_inline_blocks(full_text),
         'conversation_id': response_conversation_id or conversation_id or '',
         'message_id': assistant_message_id,
+        'images': images,
     }
 
 
@@ -622,6 +974,25 @@ class ChatGPTHandler(BaseHTTPRequestHandler):
             }).encode())
             return
         
+        if path.startswith('/files/'):
+            # Serve a generated image. The name is rebuilt from the basename so
+            # a crafted path cannot climb out of IMAGE_DIR.
+            name = os.path.basename(path[len('/files/'):])
+            full = os.path.join(IMAGE_DIR, name)
+            if name and os.path.isfile(full):
+                with open(full, 'rb') as f:
+                    blob = f.read()
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/png')
+                self.send_header('Content-Length', str(len(blob)))
+                self.send_header('Cache-Control', 'public, max-age=86400')
+                self.end_headers()
+                self.wfile.write(blob)
+            else:
+                self.send_response(404)
+                self.end_headers()
+            return
+
         if path == '/refresh':
             # Manual trigger: refresh CF cookies
             print("[http-helper] Manual cookie refresh triggered", flush=True)
@@ -654,22 +1025,19 @@ class ChatGPTHandler(BaseHTTPRequestHandler):
                             'Authorization': f'Bearer {token}',
                             'Content-Type': 'application/json',
                         }
-                        # Archive then hard delete
-                        session.patch(
+                        # Deletion is a PATCH of is_visible; DELETE answers 405.
+                        resp = session.patch(
                             f'{CHATGPT_BASE}/backend-api/conversation/{conv_id}',
                             headers=headers,
-                            json={'is_archived': True},
-                            timeout=5,
+                            json={'is_visible': False},
+                            timeout=10,
                         )
-                        session.delete(
-                            f'{CHATGPT_BASE}/backend-api/conversation/{conv_id}',
-                            headers=headers,
-                            timeout=5,
-                        )
-                        self.send_response(200)
+                        ok = resp.status_code == 200
+                        self.send_response(200 if ok else 502)
                         self.send_header('Content-Type', 'application/json')
                         self.end_headers()
-                        self.wfile.write(json.dumps({'cleaned': True}).encode())
+                        self.wfile.write(json.dumps(
+                            {'cleaned': ok, 'status': resp.status_code}).encode())
                     except Exception as e:
                         self.send_response(502)
                         self.send_header('Content-Type', 'application/json')
@@ -719,9 +1087,17 @@ class ChatGPTHandler(BaseHTTPRequestHandler):
                     print(f"[http-helper] PoW solved in {elapsed:.0f}ms", flush=True)
                 
                 # 5. Send conversation
+                allow_history = body.get('allow_history')
+                if allow_history is None:
+                    allow_history = wants_image(messages)
+                if allow_history:
+                    print("[http-helper] image request — leaving temporary chat "
+                          "so the image tool is available", flush=True)
+
                 result = send_conversation(
                     token, model, messages, sentinel_token, proof_token,
-                    conversation_id=conv_id, parent_message_id=parent_id
+                    conversation_id=conv_id, parent_message_id=parent_id,
+                    allow_history=allow_history
                 )
                 
                 if result.get('error'):
@@ -759,12 +1135,21 @@ def main():
     # Initialize session with cookies
     init_session()
     
-    session_token = dict(session.cookies).get('__Secure-next-auth.session-token', '')
-    if not session_token:
-        print("[http-helper] ERROR: No session token found!", flush=True)
+    # The session cookie is chunked into .0/.1 suffixes once it exceeds the 4KB
+    # per-cookie limit, so match on prefix rather than the exact name.
+    jar = dict(session.cookies)
+    session_token = ''.join(
+        v for k, v in sorted(jar.items())
+        if k == '__Secure-next-auth.session-token'
+        or k.startswith('__Secure-next-auth.session-token.')
+    )
+
+    if not load_token_from_env() and not session_token:
+        print("[http-helper] ERROR: no CHATGPT_ACCESS_TOKEN and no session cookie!", flush=True)
         sys.exit(1)
-    
-    print(f"[http-helper] Session token: {session_token[:30]}...", flush=True)
+
+    if session_token:
+        print(f"[http-helper] Session cookie: {len(session_token)} chars", flush=True)
     print(f"[http-helper] Device ID: {device_id}", flush=True)
     print(f"[http-helper] Impersonate: {IMPERSONATE}", flush=True)
     
